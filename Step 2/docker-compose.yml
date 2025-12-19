@@ -1,0 +1,10 @@
+services:
+  steam_data:
+    build: .
+    container_name: steam_data_analysis
+    restart: "no"
+    working_dir: /app
+    environment:
+      - OUTPUT_DIR=/output
+    volumes:
+      - ./output:/output
