@@ -12,38 +12,48 @@ import kagglehub
 DATASET_NAME = "artermiloff/steam-games-dataset"
 TARGET_FILENAME = "games_march2025_full.csv"
 
-# Output directory (mounted from host via Docker). Defaults to /output.
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
+# Output directory inside container (bind-mounted to host)
+OUTPUT_DIR = "/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Data directory inside container (bind-mounted to host)
+DATA_DIR = "/data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def ensure_dataset_file():
-    """Ensure the target CSV exists locally; download from KaggleHub if missing."""
-    local_path = os.path.join(os.getcwd(), TARGET_FILENAME)
+    """Use the mounted /data folder as the persistent cache for the Kaggle CSV.
+
+    If TARGET_FILENAME exists in DATA_DIR, reuse it.
+    Otherwise download the dataset once via KaggleHub and copy the first CSV
+    found in the downloaded folder into DATA_DIR under TARGET_FILENAME.
+    """
+
+    local_path = os.path.join(DATA_DIR, TARGET_FILENAME)
+
+    # 1) If the file is already in the mounted /data folder, just reuse it
     if os.path.exists(local_path):
+        print(f"Βρέθηκε ήδη τοπικό αρχείο dataset στο {local_path}")
         return local_path
 
-    print("Το αρχείο δεν βρέθηκε τοπικά. Γίνεται λήψη από KaggleHub...")
+    # 2) Otherwise, download (or reuse KaggleHub cache) and copy once into /data
+    print("Το αρχείο δεν βρέθηκε στο /data. Γίνεται λήψη από KaggleHub...")
     try:
         dataset_path = kagglehub.dataset_download(DATASET_NAME)
         print("Path to dataset files:", dataset_path)
     except Exception as exc:
         print(f"Αποτυχία λήψης από KaggleHub: {exc}")
-        return local_path
+        raise
 
-    candidate = os.path.join(dataset_path, TARGET_FILENAME)
-    if os.path.exists(candidate):
-        shutil.copy(candidate, local_path)
-        print(f"Αντιγράφηκε το αρχείο από KaggleHub στο {local_path}")
-        return local_path
+    # take the first CSV directly under dataset_path
+    csv_files = [f for f in os.listdir(dataset_path) if f.lower().endswith(".csv")]
+    if not csv_files:
+        raise FileNotFoundError(f"Δεν βρέθηκαν CSV αρχεία στον φάκελο: {dataset_path}")
 
-    csv_files = glob.glob(os.path.join(dataset_path, "*.csv"))
-    if csv_files:
-        shutil.copy(csv_files[0], local_path)
-        print(f"Χρήση αρχείου {os.path.basename(csv_files[0])} από KaggleHub")
-        return local_path
+    src = os.path.join(dataset_path, csv_files[0])
+    shutil.copy(src, local_path)
+    print(f"Αντιγράφηκε το αρχείο {os.path.basename(src)} στο {local_path} (mounted /data)")
 
-    print("Δεν βρέθηκε κατάλληλο CSV στο KaggleHub download.")
     return local_path
 
 # Βήμα 1: Φόρτωση Dataset
@@ -51,10 +61,11 @@ print("Φόρτωση του dataset...")
 csv_path = ensure_dataset_file()
 try:
     df = pd.read_csv(csv_path, low_memory=False)
-    print("Το dataset φορτώθηκε επιτυχώς!")
+    size_bytes = os.path.getsize(csv_path) if os.path.exists(csv_path) else 0
+    print(f"Το dataset φορτώθηκε επιτυχώς από: {csv_path} (μέγεθος: {size_bytes} bytes)")
 except FileNotFoundError:
-    print("Σφάλμα: Το αρχείο 'games_march2025_full.csv' δεν βρέθηκε στον τρέχοντα φάκελο.")
-    print("Βεβαιώσου ότι το έχεις κατεβάσει από το Kaggle και ότι βρίσκεται στο σωστό path.")
+    print(f"Σφάλμα: Το αρχείο '{TARGET_FILENAME}' δεν βρέθηκε στο {csv_path}.")
+    print("Βεβαιώσου ότι έχει κατέβει από το Kaggle και ότι βρίσκεται στο σωστό path.")
     exit()
 
 # Βήμα 2: Επισκόπηση και Βαθμίδα Καθαρισμού
