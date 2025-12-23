@@ -1,0 +1,14 @@
+services:
+  steam_data:
+    build: .
+    container_name: steam_data_analysis_spark
+    restart: "no"
+    working_dir: /app
+    volumes:
+      - ./output:/output
+      - ./data:/data
+    ports:
+      - "7077:7077"  
+      - "8080:8080"
+      - "8081:8081"
+      - "6066:6066"
