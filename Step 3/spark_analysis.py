@@ -44,6 +44,8 @@ def format_summary(df, value_col):
 
 
 def main():
+    started = datetime.now()
+    started_str = f"Η ανάλυση με Spark ξεκίνησε: " + f"{started.strftime('%Y-%m-%d %H:%M:%S')}\n"
     spark = SparkSession.builder.appName("Spark_Analysis_Application").getOrCreate()
 
     # Βήμα 1: Φόρτωση Dataset (CSV ή ήδη Parquet) και μετατροπή σε Parquet αν χρειάζεται
@@ -438,9 +440,19 @@ def main():
                 "για Pandas vs Spark/Parquet στα Βήματα 1–3.)\n\n"
             )
 
+            ended = datetime.now()
+
+            f.write(
+                started_str
+            )
+
             f.write(
                 f"Η ανάλυση με Spark ολοκληρώθηκε: "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{ended.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+
+            f.write(
+                f"Συνολικός χρόνος διέργασιας: " + str(ended-started)
             )
 
         print(f"Τα αποτελέσματα αποθηκεύτηκαν στο αρχείο '{output_filename}'.")
