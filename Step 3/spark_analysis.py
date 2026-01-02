@@ -182,12 +182,22 @@ def main():
 
     # 3. Περιγραφική στατιστική για βαθμολογίες
     print("\n3. Περιγραφική στατιστική για user_score:")
-    user_score_stats_df = df.select("user_score").summary()
+    # Υπολογισμός περιγραφικών στατιστικών μόνο για "πραγματικές" user scores (> 0)
+    user_score_stats_df = (
+        df.where(col("user_score") > 0)
+        .select("user_score")
+        .summary()
+    )
     user_score_stats_str = format_summary(user_score_stats_df, "user_score")
     print(user_score_stats_str)
 
     print("\n4. Περιγραφική στατιστική για metacritic_score:")
-    metacritic_stats_df = df.select("metacritic_score").summary()
+    # Υπολογισμός περιγραφικών στατιστικών μόνο για "πραγματικά" metacritic scores (> 0)
+    metacritic_stats_df = (
+        df.where(col("metacritic_score") > 0)
+        .select("metacritic_score")
+        .summary()
+    )
     metacritic_stats_str = format_summary(metacritic_stats_df, "metacritic_score")
     print(metacritic_stats_str)
 
