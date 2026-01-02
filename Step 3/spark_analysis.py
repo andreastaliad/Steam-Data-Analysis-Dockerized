@@ -145,8 +145,39 @@ def main():
 
     # 2. Περιγραφική στατιστική για τιμές
     print("\n2. Περιγραφική στατιστική για τιμές (price):")
+    # Χρήση όλων των τιμών για max, αλλά αγνόηση ακραίων τιμών (>1000) για τον μέσο όρο
     price_stats_df = df.select("price").summary()
-    price_stats_str = format_summary(price_stats_df, "price")
+
+    # Στατιστικά μόνο για τιμές <= 1000 (για τον μέσο όρο χωρίς ακραίες τιμές)
+    price_stats_filtered_df = (
+        df.where((col("price").isNotNull()) & (col("price") <= 1000))
+        .select("price")
+        .summary()
+    )
+
+    # Συνδυασμός: κρατάμε τον mean από το φιλτραρισμένο DF, τα υπόλοιπα από το πλήρες
+    full_rows = {r["summary"]: r for r in price_stats_df.collect()}
+    filtered_rows = {r["summary"]: r for r in price_stats_filtered_df.collect()}
+
+    ordered_summaries = [
+        "count",
+        "mean",
+        "stddev",
+        "min",
+        "25%",
+        "50%",
+        "75%",
+        "max",
+    ]
+
+    lines = []
+    for key in ordered_summaries:
+        row_dict = filtered_rows if key == "mean" and key in filtered_rows else full_rows
+        if key in row_dict:
+            value = row_dict[key]["price"]
+            lines.append(f"{key}: {value}")
+
+    price_stats_str = "\n".join(lines)
     print(price_stats_str)
 
     # 3. Περιγραφική στατιστική για βαθμολογίες
@@ -400,10 +431,14 @@ def main():
                     f"with {peak_row['game_count']} games.\n"
                 )
 
-            avg_price_overall = df.select(avg("price").alias("avg_price")).collect()[0][
-                "avg_price"
-            ]
-            median_approx = df.approxQuantile("price", [0.5], 0.01)[0]
+            # Υπολογισμός μέσης και διάμεσης τιμής αγνοώντας ακραίες τιμές (>1000)
+            df_price_no_outliers = df.where((col("price").isNotNull()) & (col("price") <= 1000))
+
+            avg_price_overall = df_price_no_outliers.select(
+                avg("price").alias("avg_price")
+            ).collect()[0]["avg_price"]
+
+            median_approx = df_price_no_outliers.approxQuantile("price", [0.5], 0.01)[0]
             f.write(
                 f"- The average game price (Spark) is {avg_price_overall:.2f} USD "
                 f"and the approximate median price is {median_approx:.2f} USD.\n"
