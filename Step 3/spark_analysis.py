@@ -461,23 +461,6 @@ def main():
                     f"(critics) is {correlation:.3f}.\n"
                 )
 
-            f.write("\nGENERATED CHARTS (SPARK):\n")
-            if os.path.exists(os.path.join(OUTPUT_DIR, "avg_price_per_year.png")):
-                f.write(
-                    "  - avg_price_per_year.png: Average price per release year "
-                    "(computed with Spark)\n"
-                )
-            if os.path.exists(os.path.join(OUTPUT_DIR, "user_vs_metacritic_score.png")):
-                f.write(
-                    "  - user_vs_metacritic_score.png: User score vs Metacritic score "
-                    "comparison (Spark)\n"
-                )
-            if os.path.exists(os.path.join(OUTPUT_DIR, "price_comparison_old_vs_new.png")):
-                f.write(
-                    "  - price_comparison_old_vs_new.png: Price comparison between "
-                    "older and newer games (Spark)\n"
-                )
-
             ended = datetime.now()
 
             f.write(started_str)
