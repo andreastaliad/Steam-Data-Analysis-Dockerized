@@ -3,12 +3,10 @@ services:
     build: .
     container_name: steam_data_analysis_spark
     restart: "no"
+    network_mode: "host"
     working_dir: /app
     volumes:
       - ./output:/output
       - ./data:/data
-    ports:
-      - "7077:7077"  
-      - "8080:8080"
-      - "8081:8081"
-      - "6066:6066"
+    environment:
+      - LLM_API_URL=http://127.0.0.1:1234/v1/chat/completions

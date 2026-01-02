@@ -14,6 +14,9 @@ import os
 import shutil
 from datetime import datetime
 import matplotlib
+import json
+import urllib.request
+import urllib.error
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -41,6 +44,95 @@ def format_summary(df, value_col):
         value = r[value_col]
         lines.append(f"{label}: {value}")
     return "\n".join(lines)
+
+
+def send_report_to_llm(report_path):
+    """Send the analysis report to the local LLM and save its response.
+
+    - Reads the text from report_path.
+    - Calls the LM Studio-compatible HTTP API.
+    - Extracts assistant content and writes it to llm_respone.txt in OUTPUT_DIR.
+    """
+
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            report_text = f.read()
+    except Exception as e:
+        print(f"Failed to read report for LLM: {e}")
+        return
+
+    instructions = (
+        "You are a professional steam data analyst, your task is to interpret the provided data and give useful\n"
+        "and to the point explanations.\n\n"
+        "Generate a human-friendly narrative of your findings.\n\n"
+        "Do not talk about the dataset it self, only the results that are found.\n\n"
+        "Produce a short explanation written in a friendly, simple tone.\n\n"
+        "Here is the analysis report you should base your answer on:\n\n"
+    )
+
+    user_content = instructions + report_text
+
+    payload = {
+        "model": "mistralai/mistral-7b-instruct-v0.3",
+        "messages": [
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.5,
+        "max_tokens": -1,
+        "stream": False,
+    }
+
+    # Use LM Studio's OpenAI-compatible endpoint by default.
+    # Allow overriding via LLM_API_URL env var (e.g. http://host.docker.internal:1234/v1/chat/completions).
+    url = os.getenv(
+        "LLM_API_URL",
+        "http://host.docker.internal:1234/v1/chat/completions",
+    )
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+    except Exception as e:
+        print(f"Failed to serialize LLM payload: {e}")
+        return
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    print(f"Calling LLM API at: {url}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp_body = resp.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        print(f"Failed to call LLM API: {e}")
+        return
+    except Exception as e:
+        print(f"Unexpected error while calling LLM API: {e}")
+        return
+
+    try:
+        obj = json.loads(resp_body)
+        choices = obj.get("choices") or []
+        if not choices:
+            print("LLM response has no choices field.")
+            return
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
+    except Exception as e:
+        print(f"Failed to parse LLM response JSON: {e}")
+        return
+
+    if not content:
+        print("LLM response content is empty.")
+        return
+
+    llm_output_path = os.path.join(OUTPUT_DIR, "llm_respone.txt")
+    try:
+        with open(llm_output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"LLM response saved to {llm_output_path}.")
+    except Exception as e:
+        print(f"Failed to write LLM response file: {e}")
 
 
 def main():
@@ -474,6 +566,12 @@ def main():
 
     except Exception as e:
         print(f"Σφάλμα κατά την εγγραφή του αρχείου: {e}")
+
+    # Αποστολή της αναλυτικής αναφοράς στο τοπικό LLM και αποθήκευση της περίληψης
+    try:
+        send_report_to_llm(output_filename)
+    except Exception as e:
+        print(f"Σφάλμα κατά την αποστολή της αναφοράς στο LLM: {e}")
 
     print("\n" + "=" * 50)
     print("Spark analysis was completed successfully!")
