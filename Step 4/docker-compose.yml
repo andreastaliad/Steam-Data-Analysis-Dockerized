@@ -1,7 +1,7 @@
 services:
   steam_data:
     build: .
-    container_name: steam_data_analysis_spark
+    container_name: steam_data_analysis_spark_llm
     restart: "no"
     network_mode: "host"
     working_dir: /app
