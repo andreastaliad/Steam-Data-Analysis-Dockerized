@@ -219,6 +219,8 @@ def main():
     else:
         print("Προειδοποίηση: Δεν βρέθηκε part-*.csv στον προσωρινό φάκελο.")
 
+    calc_started = datetime.now()
+
     # Βήμα 3: Βασικά Analytics με Spark
     print("\n--- ΒΑΣΙΚΑ ΑΝΑΛΥΤΙΚΑ ΣΤΟΙΧΕΙΑ (SPARK) ---")
 
@@ -560,9 +562,20 @@ def main():
                 f"Spark analysis completed: "
                 f"{ended.strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
+            total_duration = ended - started
+            calc_duration = ended - calc_started
             f.write(
-                f"Total execution time: {ended - started}"
+                f"Total time (dataset loading + calculations): {total_duration}\n"
             )
+            f.write(
+                f"Time for calculations only: {calc_duration}\n"
+            )
+
+        print(f"Results saved to '{output_filename}'.")
+        print(
+            f"Total time (dataset loading + calculations): {total_duration}"
+        )
+        print(f"Time for calculations only: {calc_duration}")
 
     except Exception as e:
         print(f"Σφάλμα κατά την εγγραφή του αρχείου: {e}")
