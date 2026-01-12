@@ -14,6 +14,9 @@ import os
 import shutil
 from datetime import datetime
 import matplotlib
+import json
+import urllib.request
+import urllib.error
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -43,9 +46,98 @@ def format_summary(df, value_col):
     return "\n".join(lines)
 
 
+def send_report_to_llm(report_path):
+    """Send the analysis report to the local LLM and save its response.
+
+    - Reads the text from report_path.
+    - Calls the LM Studio-compatible HTTP API.
+    - Extracts assistant content and writes it to llm_respone.txt in OUTPUT_DIR.
+    """
+
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            report_text = f.read()
+    except Exception as e:
+        print(f"Failed to read report for LLM: {e}")
+        return
+
+    instructions = (
+        "You are a professional steam data analyst, your task is to interpret the provided data and give useful\n"
+        "and to the point explanations.\n\n"
+        "Generate a human-friendly narrative of your findings.\n\n"
+        "Do not talk about the dataset it self, only the results that are found.\n\n"
+        "Produce a short explanation written in a friendly, simple tone.\n\n"
+        "Here is the analysis report you should base your answer on:\n\n"
+    )
+
+    user_content = instructions + report_text
+
+    payload = {
+        "model": "mistralai/mistral-7b-instruct-v0.3",
+        "messages": [
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.5,
+        "max_tokens": -1,
+        "stream": False,
+    }
+
+    # Use LM Studio's OpenAI-compatible endpoint by default.
+    # Allow overriding via LLM_API_URL env var (e.g. http://host.docker.internal:1234/v1/chat/completions).
+    url = os.getenv(
+        "LLM_API_URL",
+        "http://host.docker.internal:1234/v1/chat/completions",
+    )
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+    except Exception as e:
+        print(f"Failed to serialize LLM payload: {e}")
+        return
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    print(f"Calling LLM API at: {url}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp_body = resp.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        print(f"Failed to call LLM API: {e}")
+        return
+    except Exception as e:
+        print(f"Unexpected error while calling LLM API: {e}")
+        return
+
+    try:
+        obj = json.loads(resp_body)
+        choices = obj.get("choices") or []
+        if not choices:
+            print("LLM response has no choices field.")
+            return
+        message = choices[0].get("message") or {}
+        content = message.get("content") or ""
+    except Exception as e:
+        print(f"Failed to parse LLM response JSON: {e}")
+        return
+
+    if not content:
+        print("LLM response content is empty.")
+        return
+
+    llm_output_path = os.path.join(OUTPUT_DIR, "llm_respone.txt")
+    try:
+        with open(llm_output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"LLM response saved to {llm_output_path}.")
+    except Exception as e:
+        print(f"Failed to write LLM response file: {e}")
+
+
 def main():
     started = datetime.now()
-    started_str = f"Η ανάλυση με Spark ξεκίνησε: " + f"{started.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    started_str = f"Spark analysis started: " + f"{started.strftime('%Y-%m-%d %H:%M:%S')}\n"
     spark = SparkSession.builder.appName("Spark_Analysis_Application").getOrCreate()
 
     # Βήμα 1: Φόρτωση Dataset (CSV ή ήδη Parquet) και μετατροπή σε Parquet αν χρειάζεται
@@ -145,18 +237,59 @@ def main():
 
     # 2. Περιγραφική στατιστική για τιμές
     print("\n2. Περιγραφική στατιστική για τιμές (price):")
+    # Χρήση όλων των τιμών για max, αλλά αγνόηση ακραίων τιμών (>1000) για τον μέσο όρο
     price_stats_df = df.select("price").summary()
-    price_stats_str = format_summary(price_stats_df, "price")
+
+    # Στατιστικά μόνο για τιμές <= 1000 (για τον μέσο όρο χωρίς ακραίες τιμές)
+    price_stats_filtered_df = (
+        df.where((col("price").isNotNull()) & (col("price") <= 1000))
+        .select("price")
+        .summary()
+    )
+
+    # Συνδυασμός: κρατάμε τον mean από το φιλτραρισμένο DF, τα υπόλοιπα από το πλήρες
+    full_rows = {r["summary"]: r for r in price_stats_df.collect()}
+    filtered_rows = {r["summary"]: r for r in price_stats_filtered_df.collect()}
+
+    ordered_summaries = [
+        "count",
+        "mean",
+        "stddev",
+        "min",
+        "25%",
+        "50%",
+        "75%",
+        "max",
+    ]
+
+    lines = []
+    for key in ordered_summaries:
+        row_dict = filtered_rows if key == "mean" and key in filtered_rows else full_rows
+        if key in row_dict:
+            value = row_dict[key]["price"]
+            lines.append(f"{key}: {value}")
+
+    price_stats_str = "\n".join(lines)
     print(price_stats_str)
 
     # 3. Περιγραφική στατιστική για βαθμολογίες
     print("\n3. Περιγραφική στατιστική για user_score:")
-    user_score_stats_df = df.select("user_score").summary()
+    # Υπολογισμός περιγραφικών στατιστικών μόνο για "πραγματικές" user scores (> 0)
+    user_score_stats_df = (
+        df.where(col("user_score") > 0)
+        .select("user_score")
+        .summary()
+    )
     user_score_stats_str = format_summary(user_score_stats_df, "user_score")
     print(user_score_stats_str)
 
     print("\n4. Περιγραφική στατιστική για metacritic_score:")
-    metacritic_stats_df = df.select("metacritic_score").summary()
+    # Υπολογισμός περιγραφικών στατιστικών μόνο για "πραγματικά" metacritic scores (> 0)
+    metacritic_stats_df = (
+        df.where(col("metacritic_score") > 0)
+        .select("metacritic_score")
+        .summary()
+    )
     metacritic_stats_str = format_summary(metacritic_stats_df, "metacritic_score")
     print(metacritic_stats_str)
 
@@ -341,30 +474,30 @@ def main():
 
     try:
         with open(output_filename, "w", encoding="utf-8") as f:
-            f.write("ΑΠΟΤΕΛΕΣΜΑΤΑ ΑΝΑΛΥΣΗΣ STEAM DATASET (Μάρτιος 2025) - SPARK/PARQUET\n")
+            f.write("STEAM DATASET ANALYSIS RESULTS (March 2025) - SPARK/PARQUET\n")
             f.write("=" * 70 + "\n\n")
-            f.write(f"Συνολικός αριθμός παιχνιδιών στο dataset: {row_count}\n")
-            f.write(f"Αριθμός στηλών που χρησιμοποιήθηκαν: {len(df.columns)}\n")
-            f.write(f"Στήλες: {', '.join(df.columns)}\n\n")
+            f.write(f"Total number of games in the dataset: {row_count}\n")
+            f.write(f"Number of columns used: {len(df.columns)}\n")
+            f.write(f"Columns: {', '.join(df.columns)}\n\n")
 
-            f.write("1. ΚΑΤΑΜΕΤΡΗΣΗ ΠΑΙΧΝΙΔΙΩΝ ΑΝΑ ΕΤΟΣ (Top 10)\n")
+            f.write("1. GAME COUNT PER RELEASE YEAR (Top 10)\n")
             f.write("-" * 50 + "\n")
             for r in games_per_year_last10:
                 f.write(f"{r['release_year']}: {r['game_count']}\n")
             f.write("\n")
 
-            f.write("2. ΒΑΣΙΚΑ ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΤΙΜΕΣ (price) [Spark summary()]\n")
+            f.write("2. BASIC PRICE STATISTICS (price) [Spark summary()]\n")
             f.write("-" * 50 + "\n")
             f.write(price_stats_str + "\n\n")
 
-            f.write("3. ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΒΑΘΜΟΛΟΓΙΕΣ (Spark summary())\n")
+            f.write("3. SCORE STATISTICS (Spark summary())\n")
             f.write("-" * 50 + "\n")
-            f.write("User Score (Γνώμη Παικτών):\n")
+            f.write("User Score (Players' Opinion):\n")
             f.write(user_score_stats_str + "\n\n")
-            f.write("Metacritic Score (Γνώμη Κριτικών):\n")
+            f.write("Metacritic Score (Critics' Opinion):\n")
             f.write(metacritic_stats_str + "\n\n")
 
-            f.write("4. ΣΥΝΟΨΗ ΤΙΜΩΝ ΚΑΙ ΒΑΘΜΟΛΟΓΙΩΝ ΑΝΑ ΕΤΟΣ (Spark)\n")
+            f.write("4. PRICE AND SCORE SUMMARY PER YEAR (Spark)\n")
             f.write("-" * 50 + "\n")
             for r in yearly_stats_last15:
                 f.write(
@@ -374,9 +507,9 @@ def main():
                 )
             f.write("\n")
 
-            f.write("5. ΚΥΡΙΑ ΣΥΜΠΕΡΑΣΜΑΤΑ (βάσει Spark ανάλυσης)\n")
+            f.write("5. KEY INSIGHTS (based on Spark analysis)\n")
             f.write("-" * 50 + "\n")
-            f.write("- Τα περισσότερα παιχνίδια στο Steam έχουν κυκλοφορήσει τα τελευταία χρόνια.\n")
+            f.write("- Most Steam games have been released in recent years.\n")
 
             years_non_null = [
                 int(r["release_year"])
@@ -387,7 +520,7 @@ def main():
                 min_year = min(years_non_null)
                 max_year = max(years_non_null)
                 f.write(
-                    f"- Τα δεδομένα καλύπτουν την περίοδο από {min_year} έως {max_year}.\n"
+                    f"- The dataset covers the period from {min_year} to {max_year}.\n"
                 )
 
             if games_per_year_rows:
@@ -396,71 +529,52 @@ def main():
                     key=lambda r: r["game_count"] if r["game_count"] is not None else 0,
                 )
                 f.write(
-                    f"- Το έτος με τα περισσότερα παιχνίδια είναι το {peak_row['release_year']} "
-                    f"με {peak_row['game_count']} παιχνίδια.\n"
+                    f"- The year with the most game releases is {peak_row['release_year']} "
+                    f"with {peak_row['game_count']} games.\n"
                 )
 
-            avg_price_overall = df.select(avg("price").alias("avg_price")).collect()[0][
-                "avg_price"
-            ]
-            median_approx = df.approxQuantile("price", [0.5], 0.01)[0]
+            # Υπολογισμός μέσης και διάμεσης τιμής αγνοώντας ακραίες τιμές (>1000)
+            df_price_no_outliers = df.where((col("price").isNotNull()) & (col("price") <= 1000))
+
+            avg_price_overall = df_price_no_outliers.select(
+                avg("price").alias("avg_price")
+            ).collect()[0]["avg_price"]
+
+            median_approx = df_price_no_outliers.approxQuantile("price", [0.5], 0.01)[0]
             f.write(
-                f"- Η μέση τιμή των παιχνιδιών (Spark) είναι {avg_price_overall:.2f} USD "
-                f"και η προσέγγιση διάμεσης τιμής είναι {median_approx:.2f} USD.\n"
+                f"- The average game price (Spark) is {avg_price_overall:.2f} USD "
+                f"and the approximate median price is {median_approx:.2f} USD.\n"
             )
 
             if scores_count > 10:
                 correlation = scores_df.stat.corr("metacritic_score", "user_score")
                 f.write(
-                    f"- Η συσχέτιση μεταξύ user score (παίκτες) και metacritic score (κριτικοί) "
-                    f"είναι {correlation:.3f}.\n"
+                    f"- The correlation between user score (players) and metacritic score "
+                    f"(critics) is {correlation:.3f}.\n"
                 )
-
-            f.write("\nΓΡΑΦΗΜΑΤΑ ΠΟΥ ΔΗΜΙΟΥΡΓΗΘΗΚΑΝ (SPARK):\n")
-            if os.path.exists(os.path.join(OUTPUT_DIR, "avg_price_per_year.png")):
-                f.write(
-                    "  - avg_price_per_year.png: Μέση τιμή ανά έτος κυκλοφορίας "
-                    "(υπολογισμένη με Spark)\n"
-                )
-            if os.path.exists(os.path.join(OUTPUT_DIR, "user_vs_metacritic_score.png")):
-                f.write(
-                    "  - user_vs_metacritic_score.png: Σύγκριση user score vs metacritic "
-                    "score (Spark)\n"
-                )
-            if os.path.exists(os.path.join(OUTPUT_DIR, "price_comparison_old_vs_new.png")):
-                f.write(
-                    "  - price_comparison_old_vs_new.png: Σύγκριση τιμών παλιών vs "
-                    "καινούριων παιχνιδιών (Spark)\n"
-                )
-
-            f.write("\n6. ΣΥΓΚΡΙΣΗ ΧΡΟΝΩΝ ΕΚΤΕΛΕΣΗΣ PANDAS vs SPARK/PARQUET\n")
-            f.write("-" * 50 + "\n")
-            f.write(
-                "(Συμπλήρωσε χειροκίνητα εδώ τους χρόνους εκτέλεσης που μέτρησες "
-                "για Pandas vs Spark/Parquet στα Βήματα 1–3.)\n\n"
-            )
 
             ended = datetime.now()
 
+            f.write(started_str)
             f.write(
-                started_str
-            )
-
-            f.write(
-                f"Η ανάλυση με Spark ολοκληρώθηκε: "
+                f"Spark analysis completed: "
                 f"{ended.strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
-
             f.write(
-                f"Συνολικός χρόνος διέργασιας: " + str(ended-started)
+                f"Total execution time: {ended - started}"
             )
 
-        print(f"Τα αποτελέσματα αποθηκεύτηκαν στο αρχείο '{output_filename}'.")
     except Exception as e:
         print(f"Σφάλμα κατά την εγγραφή του αρχείου: {e}")
 
+    # Αποστολή της αναλυτικής αναφοράς στο τοπικό LLM και αποθήκευση της περίληψης
+    try:
+        send_report_to_llm(output_filename)
+    except Exception as e:
+        print(f"Σφάλμα κατά την αποστολή της αναφοράς στο LLM: {e}")
+
     print("\n" + "=" * 50)
-    print("Η SPARK ΑΝΑΛΥΣΗ ΟΛΟΚΛΗΡΩΘΗΚΕ ΕΠΙΤΥΧΩΣ!")
+    print("Spark analysis was completed successfully!")
     print("=" * 50)
 
     spark.stop()
