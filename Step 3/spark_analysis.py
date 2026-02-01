@@ -42,10 +42,21 @@ def format_summary(df, value_col):
         lines.append(f"{label}: {value}")
     return "\n".join(lines)
 
+def normalize_score_max(max_val):
+    """Normalize scores to a 0-100 scale based on detected range."""
+    if max_val is None:
+        return 1.0
+    scale = 1.0
+    if max_val <= 10:
+        scale = 10.0
+    elif max_val > 100 and max_val <= 1000:
+        scale = 0.1
+    elif max_val > 1000:
+        scale = 0.01
+    return scale
+
 
 def main():
-    started = datetime.now()
-    started_str = f"Η ανάλυση με Spark ξεκίνησε: " + f"{started.strftime('%Y-%m-%d %H:%M:%S')}\n"
     spark = SparkSession.builder.appName("Spark_Analysis_Application").getOrCreate()
 
     # Βήμα 1: Φόρτωση Dataset (CSV ή ήδη Parquet) και μετατροπή σε Parquet αν χρειάζεται
@@ -75,9 +86,9 @@ def main():
         regexp_replace(col("price"), "[^0-9.]", "").cast("double").alias("price"),
         regexp_replace(col("user_score"), "[^0-9.]", "").cast("double").alias("user_score"),
         regexp_replace(col("metacritic_score"), "[^0-9.]", "").cast("double").alias("metacritic_score"),
-        "positive",
-        "negative",
-        "pct_pos_total",
+        col("positive").cast("double").alias("positive"),
+        col("negative").cast("double").alias("negative"),
+        regexp_replace(col("pct_pos_total"), "[^0-9.]", "").cast("double").alias("pct_pos_total"),
         "categories",
         "genres",
         "tags",
@@ -127,10 +138,8 @@ def main():
     else:
         print("Προειδοποίηση: Δεν βρέθηκε part-*.csv στον προσωρινό φάκελο.")
 
-    calc_started = datetime.now()
-
     # Βήμα 3: Βασικά Analytics με Spark
-    print("\n--- ΒΑΣΙΚΑ ΑΝΑΛΥΤΙΚΑ ΣΤΟΙΧΕΙΑ (SPARK) ---")
+    print("\n--- ΒΑΣΙΚΑ ΑΝΑΛΥΤΙΚΑ ΣΤΟΙΧΕΙΑ (ANALYTICS) ---")
 
     # 1. Καταμέτρηση παιχνιδιών ανά έτος κυκλοφορίας (Top 10)
     games_per_year_df = (
@@ -198,8 +207,25 @@ def main():
             f"avg_pct_pos={r['avg_pct_pos']}"
         )
 
+    yearly_stats_mc_last15 = []
+    if "release_year" in df.columns:
+        df_mc = df.where(col("metacritic_score").isNotNull() & (col("metacritic_score") > 0))
+        yearly_stats_mc_df = (
+            df_mc.where(col("release_year").isNotNull())
+            .groupBy("release_year")
+            .agg(
+                count("name").alias("game_count"),
+                avg("price").alias("avg_price"),
+            )
+            .withColumn("avg_price", spark_round(col("avg_price"), 2))
+            .where(col("game_count") > 30)
+            .orderBy("release_year")
+        )
+        yearly_stats_mc_rows = yearly_stats_mc_df.collect()
+        yearly_stats_mc_last15 = yearly_stats_mc_rows[-15:]
+
     # Βήμα 4: Δημιουργία Γραφημάτων (με δεδομένα από Spark)
-    print("\n--- ΔΗΜΙΟΥΡΓΙΑ ΓΡΑΦΗΜΑΤΩΝ (SPARK) ---")
+    print("\n--- ΔΗΜΙΟΥΡΓΙΑ ΓΡΑΦΗΜΑΤΩΝ ---")
 
     # Γράφημα 1: Μέση τιμή ανά έτος (έτη με >30 παιχνίδια)
     if yearly_stats_last15:
@@ -229,16 +255,57 @@ def main():
     else:
         print("Δεν υπάρχουν δεδομένα yearly_stats για το γράφημα τιμών ανά έτος")
 
+    # Γράφημα 1b: Μέση τιμή ανά έτος (μόνο παιχνίδια με Metacritic)
+    if yearly_stats_mc_last15:
+        years_mc = [int(r["release_year"]) for r in yearly_stats_mc_last15 if r["avg_price"] is not None]
+        avg_prices_mc = [float(r["avg_price"]) for r in yearly_stats_mc_last15 if r["avg_price"] is not None]
+        if years_mc and avg_prices_mc:
+            plt.figure(figsize=(12, 6))
+            ax = plt.gca()
+            ax.bar(range(len(years_mc)), avg_prices_mc, color="seagreen")
+            ax.set_title(
+                "Μέση Τιμή Παιχνιδιών Steam ανά Έτος (με Metacritic Score)\n(Για έτη με πάνω από 30 παιχνίδια)",
+                fontsize=14,
+            )
+            ax.set_xlabel("Έτος Κυκλοφορίας")
+            ax.set_ylabel("Μέση Τιμή (USD)")
+            ax.set_xticks(range(len(years_mc)))
+            ax.set_xticklabels(years_mc, rotation=45)
+            for i, v in enumerate(avg_prices_mc):
+                ax.text(i, v + 0.5, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
+            plt.tight_layout()
+            out_path = os.path.join(OUTPUT_DIR, "avg_price_per_year_metacritic.png")
+            plt.savefig(out_path, dpi=150)
+            plt.close()
+            print(f"Το γράφημα 'avg_price_per_year_metacritic.png' αποθηκεύτηκε στο {out_path}.")
+        else:
+            print("Δεν υπάρχουν δεδομένα για το γράφημα τιμών (μόνο με Metacritic)")
+    else:
+        print("Δεν υπάρχουν δεδομένα για το γράφημα τιμών (μόνο με Metacritic)")
+
     # Γράφημα 2: Σύγκριση user_score vs metacritic_score
-    scores_df = df.select("metacritic_score", "user_score").where(
-        col("metacritic_score").isNotNull() & col("user_score").isNotNull()
+    user_score_col = when(col("pct_pos_total").isNotNull(), col("pct_pos_total")).otherwise(col("positive_ratio"))
+    scores_df = (
+        df.withColumn("user_score_plot", user_score_col)
+        .where(
+            col("metacritic_score").isNotNull() & (col("metacritic_score") > 0) &
+            col("user_score_plot").isNotNull() & (col("user_score_plot") > 0)
+        )
+        .select("metacritic_score", "user_score_plot")
     )
     scores_count = scores_df.count()
     if scores_count > 10:
         scores_sample = scores_df.limit(5000)
         rows = scores_sample.collect()
-        x = [float(r["metacritic_score"]) for r in rows]
-        y = [float(r["user_score"]) for r in rows]
+        x_raw = [float(r["metacritic_score"]) for r in rows]
+        y = [min(max(float(r["user_score_plot"]), 0.0), 100.0) for r in rows]
+
+        max_meta_row = df.select("metacritic_score").agg({"metacritic_score": "max"}).collect()
+        max_meta = max_meta_row[0][0] if max_meta_row else None
+        scale = normalize_score_max(max_meta)
+        if scale != 1.0 and max_meta is not None:
+            print(f"Κανονικοποίηση metacritic_score: max={max_meta:.2f}, scale={scale}")
+        x = [min(max(val * scale, 0.0), 100.0) for val in x_raw]
 
         plt.figure(figsize=(10, 6))
         plt.scatter(x, y, alpha=0.5)
@@ -246,8 +313,8 @@ def main():
             "Σύγκριση Βαθμολογιών: User Score vs Metacritic Score\n(Γνώμη Παικτών vs Γνώμη Κριτικών)",
             fontsize=14,
         )
-        plt.xlabel("Metacritic Score (Κριτικοί)")
-        plt.ylabel("User Score (Παίκτες)")
+        plt.xlabel("Metacritic Score (Κριτικοί, 0-100)")
+        plt.ylabel("Positive % (Χρήστες, 0-100)")
 
         if len(x) > 1:
             z = np.polyfit(x, y, 1)
@@ -255,7 +322,7 @@ def main():
             xs_line = np.linspace(min(x), max(x), 100)
             plt.plot(xs_line, p(xs_line), "r--", alpha=0.8)
 
-        correlation = scores_df.stat.corr("metacritic_score", "user_score")
+        correlation = scores_df.stat.corr("metacritic_score", "user_score_plot")
         plt.text(
             0.05,
             0.95,
@@ -337,14 +404,72 @@ def main():
     else:
         print("Δεν υπάρχουν αρκετά δεδομένα για boxplot τιμών")
 
+    # Γράφημα 3b: Κατανομή Τιμών (Παλιά vs Καινούρια) μόνο με Metacritic
+    price_data_mc = df_era.where(
+        (col("price").isNotNull())
+        & (col("price") >= 0)
+        & (col("price") <= 100)
+        & col("era").isNotNull()
+        & col("metacritic_score").isNotNull()
+        & (col("metacritic_score") > 0)
+    )
+
+    old_rows_mc = price_data_mc.where(col("era") == "Παλιά (μέχρι 2014)").select("price").collect()
+    new_rows_mc = price_data_mc.where(col("era") == "Καινούρια (2015+)").select("price").collect()
+
+    old_prices_mc = [float(r["price"]) for r in old_rows_mc]
+    new_prices_mc = [float(r["price"]) for r in new_rows_mc]
+
+    if old_prices_mc and new_prices_mc:
+        plt.figure(figsize=(12, 6))
+        ax = plt.gca()
+        ax.boxplot([old_prices_mc, new_prices_mc], labels=["Παλιά (μέχρι 2014)", "Καινούρια (2015+)"])
+        ax.set_title(
+            "Σύγκριση Κατανομής Τιμών (Μόνο με Metacritic)\n(Παλιά = μέχρι 2014, Καινούρια = 2015 και μετά)",
+            fontsize=14,
+        )
+        ax.set_xlabel("Εποχή Παιχνιδιού")
+        ax.set_ylabel("Τιμή (USD)")
+
+        old_mean_mc = float(np.mean(old_prices_mc))
+        old_median_mc = float(np.median(old_prices_mc))
+        new_mean_mc = float(np.mean(new_prices_mc))
+        new_median_mc = float(np.median(new_prices_mc))
+
+        stats_text_mc = (
+            f"Παλιά: Μέση τιμή = ${old_mean_mc:.2f}, Διάμεσος = ${old_median_mc:.2f}\n"
+            f"Καινούρια: Μέση τιμή = ${new_mean_mc:.2f}, Διάμεσος = ${new_median_mc:.2f}"
+        )
+
+        plt.text(
+            0.02,
+            0.98,
+            stats_text_mc,
+            transform=plt.gca().transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+        plt.tight_layout()
+        out_path = os.path.join(OUTPUT_DIR, "price_comparison_old_vs_new_metacritic.png")
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(
+            "Το γράφημα 'price_comparison_old_vs_new_metacritic.png' αποθηκεύτηκε στο "
+            f"{out_path}."
+        )
+    else:
+        print("Δεν υπάρχουν αρκετά δεδομένα για boxplot τιμών (μόνο με Metacritic)")
+
     # Βήμα 5: Εγγραφή Αποτελεσμάτων σε Αρχείο .txt (Spark έκδοση)
-    print("\n--- ΕΓΓΡΑΦΗ ΑΠΟΤΕΛΕΣΜΑΤΩΝ (SPARK) ---")
+    print("\n--- ΕΓΓΡΑΦΗ ΑΠΟΤΕΛΕΣΜΑΤΩΝ ---")
     output_filename = os.path.join(OUTPUT_DIR, "analysis_results.txt")
 
     try:
         with open(output_filename, "w", encoding="utf-8") as f:
-            f.write("ΑΠΟΤΕΛΕΣΜΑΤΑ ΑΝΑΛΥΣΗΣ STEAM DATASET (Μάρτιος 2025) - SPARK/PARQUET\n")
-            f.write("=" * 70 + "\n\n")
+            f.write("ΑΠΟΤΕΛΕΣΜΑΤΑ ΑΝΑΛΥΣΗΣ STEAM DATASET (Μάρτιος 2025)\n")
+            f.write("=" * 60 + "\n\n")
             f.write(f"Συνολικός αριθμός παιχνιδιών στο dataset: {row_count}\n")
             f.write(f"Αριθμός στηλών που χρησιμοποιήθηκαν: {len(df.columns)}\n")
             f.write(f"Στήλες: {', '.join(df.columns)}\n\n")
@@ -355,18 +480,18 @@ def main():
                 f.write(f"{r['release_year']}: {r['game_count']}\n")
             f.write("\n")
 
-            f.write("2. ΒΑΣΙΚΑ ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΤΙΜΕΣ (price) [Spark summary()]\n")
+            f.write("2. ΒΑΣΙΚΑ ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΤΙΜΕΣ (price)\n")
             f.write("-" * 50 + "\n")
             f.write(price_stats_str + "\n\n")
 
-            f.write("3. ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΒΑΘΜΟΛΟΓΙΕΣ (Spark summary())\n")
+            f.write("3. ΣΤΑΤΙΣΤΙΚΑ ΓΙΑ ΒΑΘΜΟΛΟΓΙΕΣ\n")
             f.write("-" * 50 + "\n")
             f.write("User Score (Γνώμη Παικτών):\n")
             f.write(user_score_stats_str + "\n\n")
             f.write("Metacritic Score (Γνώμη Κριτικών):\n")
             f.write(metacritic_stats_str + "\n\n")
 
-            f.write("4. ΣΥΝΟΨΗ ΤΙΜΩΝ ΚΑΙ ΒΑΘΜΟΛΟΓΙΩΝ ΑΝΑ ΕΤΟΣ (Spark)\n")
+            f.write("4. ΣΥΝΟΨΗ ΤΙΜΩΝ ΚΑΙ ΒΑΘΜΟΛΟΓΙΩΝ ΑΝΑ ΕΤΟΣ\n")
             f.write("-" * 50 + "\n")
             for r in yearly_stats_last15:
                 f.write(
@@ -376,7 +501,16 @@ def main():
                 )
             f.write("\n")
 
-            f.write("5. ΚΥΡΙΑ ΣΥΜΠΕΡΑΣΜΑΤΑ (βάσει Spark ανάλυσης)\n")
+            if yearly_stats_mc_last15:
+                f.write("4b. ΣΥΝΟΨΗ ΤΙΜΩΝ ΑΝΑ ΕΤΟΣ (ΜΟΝΟ ΜΕ METACRITIC)\n")
+                f.write("-" * 50 + "\n")
+                for r in yearly_stats_mc_last15:
+                    f.write(
+                        f"{r['release_year']}: count={r['game_count']}, avg_price={r['avg_price']}\n"
+                    )
+                f.write("\n")
+
+            f.write("5. ΚΥΡΙΑ ΣΥΜΠΕΡΑΣΜΑΤΑ\n")
             f.write("-" * 50 + "\n")
             f.write("- Τα περισσότερα παιχνίδια στο Steam έχουν κυκλοφορήσει τα τελευταία χρόνια.\n")
 
@@ -402,77 +536,65 @@ def main():
                     f"με {peak_row['game_count']} παιχνίδια.\n"
                 )
 
-            avg_price_overall = df.select(avg("price").alias("avg_price")).collect()[0][
-                "avg_price"
-            ]
+            mc_with = df.where(col("metacritic_score").isNotNull() & (col("metacritic_score") > 0)).count()
+            mc_without = df.where(col("metacritic_score").isNull() | (col("metacritic_score") <= 0)).count()
+            f.write(f"- Παιχνίδια με Metacritic score: {mc_with} | χωρίς Metacritic: {mc_without}.\n")
+            if mc_without > mc_with:
+                f.write("- Το μεγαλύτερο πλήθος παιχνιδιών δεν έχει Metacritic score.\n")
+            else:
+                f.write("- Το μεγαλύτερο πλήθος παιχνιδιών έχει Metacritic score.\n")
+
+            avg_price_overall = df.select(avg("price").alias("avg_price")).collect()[0]["avg_price"]
             median_approx = df.approxQuantile("price", [0.5], 0.01)[0]
             f.write(
-                f"- Η μέση τιμή των παιχνιδιών (Spark) είναι {avg_price_overall:.2f} USD "
-                f"και η προσέγγιση διάμεσης τιμής είναι {median_approx:.2f} USD.\n"
+                f"- Η μέση τιμή των παιχνιδιών είναι {avg_price_overall:.2f} USD "
+                f"και η διάμεσος τιμή είναι {median_approx:.2f} USD.\n"
             )
 
             if scores_count > 10:
-                correlation = scores_df.stat.corr("metacritic_score", "user_score")
+                correlation = scores_df.stat.corr("metacritic_score", "user_score_plot")
                 f.write(
-                    f"- Η συσχέτιση μεταξύ user score (παίκτες) και metacritic score (κριτικοί) "
+                    f"- Η συσχέτιση μεταξύ positive % (παίκτες) και metacritic score (κριτικοί) "
                     f"είναι {correlation:.3f}.\n"
                 )
+                if correlation > 0.7:
+                    f.write("  (Υψηλή θετική συσχέτιση: Παίκτες και κριτικοί τείνουν να συμφωνούν)\n")
+                elif correlation > 0.3:
+                    f.write("  (Μέτρια θετική συσχέτιση: Υπάρχει κάποια συμφωνία)\n")
+                else:
+                    f.write("  (Χαμηλή συσχέτιση: Παίκτες και κριτικών έχουν διαφορετικές απόψεις)\n")
 
-            f.write("\nΓΡΑΦΗΜΑΤΑ ΠΟΥ ΔΗΜΙΟΥΡΓΗΘΗΚΑΝ (SPARK):\n")
+            f.write("\nΓΡΑΦΗΜΑΤΑ ΠΟΥ ΔΗΜΙΟΥΡΓΗΘΗΚΑΝ:\n")
             if os.path.exists(os.path.join(OUTPUT_DIR, "avg_price_per_year.png")):
                 f.write(
-                    "  - avg_price_per_year.png: Μέση τιμή ανά έτος κυκλοφορίας "
-                    "(υπολογισμένη με Spark)\n"
+                    "  - avg_price_per_year.png: Μέση τιμή ανά έτος κυκλοφορίας\n"
+                )
+            if os.path.exists(os.path.join(OUTPUT_DIR, "avg_price_per_year_metacritic.png")):
+                f.write(
+                    "  - avg_price_per_year_metacritic.png: Μέση τιμή ανά έτος (μόνο με Metacritic)\n"
                 )
             if os.path.exists(os.path.join(OUTPUT_DIR, "user_vs_metacritic_score.png")):
                 f.write(
-                    "  - user_vs_metacritic_score.png: Σύγκριση user score vs metacritic "
-                    "score (Spark)\n"
+                    "  - user_vs_metacritic_score.png: Σύγκριση user score vs metacritic score\n"
                 )
             if os.path.exists(os.path.join(OUTPUT_DIR, "price_comparison_old_vs_new.png")):
                 f.write(
-                    "  - price_comparison_old_vs_new.png: Σύγκριση τιμών παλιών vs "
-                    "καινούριων παιχνιδιών (Spark)\n"
+                    "  - price_comparison_old_vs_new.png: Σύγκριση τιμών παλιών vs καινούριων παιχνιδιών\n"
+                )
+            if os.path.exists(os.path.join(OUTPUT_DIR, "price_comparison_old_vs_new_metacritic.png")):
+                f.write(
+                    "  - price_comparison_old_vs_new_metacritic.png: Σύγκριση τιμών παλιών vs "
+                    "καινούριων (μόνο με Metacritic)\n"
                 )
 
-            f.write("\n6. ΣΥΓΚΡΙΣΗ ΧΡΟΝΩΝ ΕΚΤΕΛΕΣΗΣ PANDAS vs SPARK/PARQUET\n")
-            f.write("-" * 50 + "\n")
-            f.write(
-                "(Συμπλήρωσε χειροκίνητα εδώ τους χρόνους εκτέλεσης που μέτρησες "
-                "για Pandas vs Spark/Parquet στα Βήματα 1–3.)\n\n"
-            )
-
-            ended = datetime.now()
-
-            f.write(
-                started_str
-            )
-
-            f.write(
-                f"Η ανάλυση με Spark ολοκληρώθηκε: "
-                f"{ended.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            )
-
-            total_duration = ended - started
-            calc_duration = ended - calc_started
-
-            f.write(
-                f"Συνολικός χρόνος (φόρτωση dataset + υπολογισμοί): {total_duration}\n"
-            )
-            f.write(
-                f"Χρόνος μόνο για υπολογισμούς: {calc_duration}\n"
-            )
+            f.write(f"\nΗ ανάλυση ολοκληρώθηκε: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         print(f"Τα αποτελέσματα αποθηκεύτηκαν στο αρχείο '{output_filename}'.")
-        print(
-            f"Συνολικός χρόνος (φόρτωση dataset + υπολογισμοί): {total_duration}"
-        )
-        print(f"Χρόνος μόνο για υπολογισμούς: {calc_duration}")
     except Exception as e:
         print(f"Σφάλμα κατά την εγγραφή του αρχείου: {e}")
 
     print("\n" + "=" * 50)
-    print("Η SPARK ΑΝΑΛΥΣΗ ΟΛΟΚΛΗΡΩΘΗΚΕ ΕΠΙΤΥΧΩΣ!")
+    print("Η ΑΝΑΛΥΣΗ ΟΛΟΚΛΗΡΩΘΗΚΕ ΕΠΙΤΥΧΩΣ!")
     print("=" * 50)
 
     spark.stop()

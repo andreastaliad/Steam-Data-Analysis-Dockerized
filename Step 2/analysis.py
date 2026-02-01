@@ -12,48 +12,34 @@ import kagglehub
 DATASET_NAME = "artermiloff/steam-games-dataset"
 TARGET_FILENAME = "games_march2025_full.csv"
 
-# Output directory inside container (bind-mounted to host)
-OUTPUT_DIR = "/output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Data directory inside container (bind-mounted to host)
-DATA_DIR = "/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
 
 def ensure_dataset_file():
-    """Use the mounted /data folder as the persistent cache for the Kaggle CSV.
-
-    If TARGET_FILENAME exists in DATA_DIR, reuse it.
-    Otherwise download the dataset once via KaggleHub and copy the first CSV
-    found in the downloaded folder into DATA_DIR under TARGET_FILENAME.
-    """
-
-    local_path = os.path.join(DATA_DIR, TARGET_FILENAME)
-
-    # 1) If the file is already in the mounted /data folder, just reuse it
+    """Ensure the target CSV exists locally; download from KaggleHub if missing."""
+    local_path = os.path.join(os.getcwd(), TARGET_FILENAME)
     if os.path.exists(local_path):
-        print(f"Βρέθηκε ήδη τοπικό αρχείο dataset στο {local_path}")
         return local_path
 
-    # 2) Otherwise, download (or reuse KaggleHub cache) and copy once into /data
-    print("Το αρχείο δεν βρέθηκε στο /data. Γίνεται λήψη από KaggleHub...")
+    print("Το αρχείο δεν βρέθηκε τοπικά. Γίνεται λήψη από KaggleHub...")
     try:
         dataset_path = kagglehub.dataset_download(DATASET_NAME)
         print("Path to dataset files:", dataset_path)
     except Exception as exc:
         print(f"Αποτυχία λήψης από KaggleHub: {exc}")
-        raise
+        return local_path
 
-    # take the first CSV directly under dataset_path
-    csv_files = [f for f in os.listdir(dataset_path) if f.lower().endswith(".csv")]
-    if not csv_files:
-        raise FileNotFoundError(f"Δεν βρέθηκαν CSV αρχεία στον φάκελο: {dataset_path}")
+    candidate = os.path.join(dataset_path, TARGET_FILENAME)
+    if os.path.exists(candidate):
+        shutil.copy(candidate, local_path)
+        print(f"Αντιγράφηκε το αρχείο από KaggleHub στο {local_path}")
+        return local_path
 
-    src = os.path.join(dataset_path, csv_files[0])
-    shutil.copy(src, local_path)
-    print(f"Αντιγράφηκε το αρχείο {os.path.basename(src)} στο {local_path} (mounted /data)")
+    csv_files = glob.glob(os.path.join(dataset_path, "*.csv"))
+    if csv_files:
+        shutil.copy(csv_files[0], local_path)
+        print(f"Χρήση αρχείου {os.path.basename(csv_files[0])} από KaggleHub")
+        return local_path
 
+    print("Δεν βρέθηκε κατάλληλο CSV στο KaggleHub download.")
     return local_path
 
 # Βήμα 1: Φόρτωση Dataset
@@ -61,11 +47,10 @@ print("Φόρτωση του dataset...")
 csv_path = ensure_dataset_file()
 try:
     df = pd.read_csv(csv_path, low_memory=False)
-    size_bytes = os.path.getsize(csv_path) if os.path.exists(csv_path) else 0
-    print(f"Το dataset φορτώθηκε επιτυχώς από: {csv_path} (μέγεθος: {size_bytes} bytes)")
+    print("Το dataset φορτώθηκε επιτυχώς!")
 except FileNotFoundError:
-    print(f"Σφάλμα: Το αρχείο '{TARGET_FILENAME}' δεν βρέθηκε στο {csv_path}.")
-    print("Βεβαιώσου ότι έχει κατέβει από το Kaggle και ότι βρίσκεται στο σωστό path.")
+    print("Σφάλμα: Το αρχείο 'games_march2025_full.csv' δεν βρέθηκε στον τρέχοντα φάκελο.")
+    print("Βεβαιώσου ότι το έχεις κατεβάσει από το Kaggle και ότι βρίσκεται στο σωστό path.")
     exit()
 
 # Βήμα 2: Επισκόπηση και Βαθμίδα Καθαρισμού
@@ -99,6 +84,27 @@ if 'user_score' in df.columns:
     df['user_score'] = pd.to_numeric(df['user_score'], errors='coerce')
 if 'metacritic_score' in df.columns:
     df['metacritic_score'] = pd.to_numeric(df['metacritic_score'], errors='coerce')
+
+def normalize_score(series, label):
+    """Normalize scores to a 0-100 scale based on detected range."""
+    s = pd.to_numeric(series, errors='coerce')
+    max_val = s.max()
+    if pd.isna(max_val):
+        return s
+
+    scale = 1.0
+    if max_val <= 10:
+        scale = 10.0
+    elif max_val > 100 and max_val <= 1000:
+        scale = 0.1
+    elif max_val > 1000:
+        scale = 0.01
+
+    if scale != 1.0:
+        print(f"Κανονικοποίηση {label}: max={max_val:.2f}, scale={scale}")
+        s = s * scale
+
+    return s.clip(lower=0, upper=100)
 
 # Υπολογισμός ποσοστού θετικών κριτικών (αν δεν υπάρχει ήδη η στήλη pct_pos_total)
 if all(col in df.columns for col in ['positive', 'negative']):
@@ -163,6 +169,17 @@ else:
     yearly_stats_filtered = None
     print("Δεν υπάρχουν αρκετές στήλες για να γίνει ομαδοποίηση")
 
+# Στατιστικά τιμών για παιχνίδια με πραγματικό Metacritic score
+yearly_stats_mc_filtered = None
+if 'release_year' in df.columns and 'price' in df.columns and 'metacritic_score' in df.columns:
+    df_mc = df[df['metacritic_score'].notna() & (df['metacritic_score'] > 0)]
+    if not df_mc.empty:
+        yearly_stats_mc = df_mc.groupby('release_year').agg(
+            game_count=('name', 'count'),
+            avg_price=('price', 'mean')
+        ).round(2)
+        yearly_stats_mc_filtered = yearly_stats_mc[yearly_stats_mc['game_count'] > 30].tail(15)
+
 # Βήμα 4: Δημιουργία Γραφημάτων
 print("\n--- ΔΗΜΙΟΥΡΓΙΑ ΓΡΑΦΗΜΑΤΩΝ ---")
 
@@ -179,38 +196,76 @@ if yearly_stats_filtered is not None and 'avg_price' in yearly_stats_filtered.co
         if not pd.isna(v):
             ax.text(i, v + 0.5, f'{v:.2f}', ha='center', va='bottom', fontsize=9)
     plt.tight_layout()
-    _out_path = os.path.join(OUTPUT_DIR, 'avg_price_per_year.png')
-    plt.savefig(_out_path, dpi=150)
-    print(f"Το γράφημα 'avg_price_per_year.png' αποθηκεύτηκε στο { _out_path }.")
+    plt.savefig('avg_price_per_year.png', dpi=150)
+    print("Το γράφημα 'avg_price_per_year.png' αποθηκεύτηκε.")
 else:
     print("Δεν υπάρχουν δεδομένα για το γράφημα τιμών ανά έτος")
 
+# Γράφημα 1b: Μέση τιμή ανά έτος (μόνο παιχνίδια με Metacritic)
+if yearly_stats_mc_filtered is not None and 'avg_price' in yearly_stats_mc_filtered.columns:
+    plt.figure(figsize=(12, 6))
+    ax = yearly_stats_mc_filtered['avg_price'].plot(kind='bar', color='seagreen')
+    plt.title('Μέση Τιμή Παιχνιδιών Steam ανά Έτος (με Metacritic Score)\n(Για έτη με πάνω από 30 παιχνίδια)', fontsize=14)
+    plt.xlabel('Έτος Κυκλοφορίας')
+    plt.ylabel('Μέση Τιμή (USD)')
+    plt.xticks(rotation=45)
+    for i, v in enumerate(yearly_stats_mc_filtered['avg_price']):
+        if not pd.isna(v):
+            ax.text(i, v + 0.5, f'{v:.2f}', ha='center', va='bottom', fontsize=9)
+    plt.tight_layout()
+    plt.savefig('avg_price_per_year_metacritic.png', dpi=150)
+    print("Το γράφημα 'avg_price_per_year_metacritic.png' αποθηκεύτηκε.")
+else:
+    print("Δεν υπάρχουν δεδομένα για το γράφημα τιμών (μόνο με Metacritic)")
+
+
 # Γράφημα 2: Σύγκριση βαθμολογιών user_score vs metacritic_score (αν υπάρχουν)
 if all(col in df.columns for col in ['user_score', 'metacritic_score']):
+    df['metacritic_score_norm'] = normalize_score(df['metacritic_score'], 'metacritic_score')
     # Φιλτράρουμε τις γραμμές που έχουν και τις δύο βαθμολογίες
-    scores_df = df[['user_score', 'metacritic_score']].dropna()
+    user_series = None
+    user_label = None
+    if 'pct_pos_total' in df.columns:
+        user_series = pd.to_numeric(df['pct_pos_total'], errors='coerce')
+        user_label = 'Positive % (Χρήστες, 0-100)'
+    elif 'positive_ratio_calc' in df.columns:
+        user_series = pd.to_numeric(df['positive_ratio_calc'], errors='coerce')
+        user_label = 'Positive % (Χρήστες, 0-100)'
+    else:
+        user_series = pd.Series(index=df.index, dtype='float64')
+        user_label = 'Positive % (Χρήστες, 0-100)'
+
+    user_series = user_series.clip(lower=0, upper=100)
+    valid_mask = (
+        df['metacritic_score'].notna() & (df['metacritic_score'] > 0) &
+        user_series.notna() & (user_series > 0)
+    )
+
+    scores_df = pd.DataFrame({
+        'user_score_plot': user_series,
+        'metacritic_score_norm': df['metacritic_score_norm']
+    })[valid_mask].dropna()
     if len(scores_df) > 10:
         plt.figure(figsize=(10, 6))
-        plt.scatter(scores_df['metacritic_score'], scores_df['user_score'], alpha=0.5)
+        plt.scatter(scores_df['metacritic_score_norm'], scores_df['user_score_plot'], alpha=0.5)
         plt.title('Σύγκριση Βαθμολογιών: User Score vs Metacritic Score\n(Γνώμη Παικτών vs Γνώμη Κριτικών)', fontsize=14)
-        plt.xlabel('Metacritic Score (Κριτικοί)')
-        plt.ylabel('User Score (Παίκτες)')
+        plt.xlabel('Metacritic Score (Κριτικοί, 0-100)')
+        plt.ylabel(user_label)
         
         # Προσθήκη γραμμής συσχέτισης
-        z = np.polyfit(scores_df['metacritic_score'], scores_df['user_score'], 1)
+        z = np.polyfit(scores_df['metacritic_score_norm'], scores_df['user_score_plot'], 1)
         p = np.poly1d(z)
-        plt.plot(scores_df['metacritic_score'], p(scores_df['metacritic_score']), "r--", alpha=0.8)
+        plt.plot(scores_df['metacritic_score_norm'], p(scores_df['metacritic_score_norm']), "r--", alpha=0.8)
         
         # Προσθήκη συντελεστή συσχέτισης
-        correlation = scores_df['user_score'].corr(scores_df['metacritic_score'])
+        correlation = scores_df['user_score_plot'].corr(scores_df['metacritic_score_norm'])
         plt.text(0.05, 0.95, f'Συσχέτιση: {correlation:.3f}', transform=plt.gca().transAxes, 
                 fontsize=12, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        _out_path = os.path.join(OUTPUT_DIR, 'user_vs_metacritic_score.png')
-        plt.savefig(_out_path, dpi=150)
-        print(f"Το γράφημα 'user_vs_metacritic_score.png' αποθηκεύτηκε στο { _out_path }.")
+        plt.savefig('user_vs_metacritic_score.png', dpi=150)
+        print("Το γράφημα 'user_vs_metacritic_score.png' αποθηκεύτηκε.")
     else:
         print("Δεν υπάρχουν αρκετά δεδομένα για σύγκριση user_score vs metacritic_score")
 else:
@@ -243,17 +298,48 @@ if 'price' in df.columns and 'release_year' in df.columns:
                 fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         plt.tight_layout()
-        _out_path = os.path.join(OUTPUT_DIR, 'price_comparison_old_vs_new.png')
-        plt.savefig(_out_path, dpi=150)
-        print(f"Το γράφημα 'price_comparison_old_vs_new.png' αποθηκεύτηκε στο { _out_path }.")
+        plt.savefig('price_comparison_old_vs_new.png', dpi=150)
+        print("Το γράφημα 'price_comparison_old_vs_new.png' αποθηκεύτηκε.")
     else:
         print("Δεν υπάρχουν αρκετά δεδομένα για boxplot τιμών")
 else:
     print("Δεν υπάρχουν στήλες price ή release_year για το boxplot")
 
+# Γράφημα 3b: Κατανομή Τιμών (Παλιά vs Καινούρια) μόνο με Metacritic
+if all(col in df.columns for col in ['price', 'release_year', 'metacritic_score']):
+    plt.figure(figsize=(12, 6))
+    df['era'] = pd.cut(df['release_year'],
+                       bins=[0, 2014, df['release_year'].max()],
+                       labels=['Παλιά (μέχρι 2014)', 'Καινούρια (2015+)'])
+    price_data_mc = df[(df['price'] >= 0) & (df['price'] <= 100) &
+                       (df['era'].notna()) &
+                       (df['metacritic_score'].notna()) & (df['metacritic_score'] > 0)]
+    if not price_data_mc.empty:
+        sns.boxplot(x='era', y='price', data=price_data_mc, palette='Set2')
+        plt.title('Σύγκριση Κατανομής Τιμών (Μόνο με Metacritic)\n(Παλιά = μέχρι 2014, Καινούρια = 2015 και μετά)', fontsize=14)
+        plt.xlabel('Εποχή Παιχνιδιού')
+        plt.ylabel('Τιμή (USD)')
+
+        old_games = price_data_mc[price_data_mc['era'] == 'Παλιά (μέχρι 2014)']['price']
+        new_games = price_data_mc[price_data_mc['era'] == 'Καινούρια (2015+)']['price']
+
+        stats_text = f"Παλιά: Μέση τιμή = ${old_games.mean():.2f}, Διάμεσος = ${old_games.median():.2f}\n"
+        stats_text += f"Καινούρια: Μέση τιμή = ${new_games.mean():.2f}, Διάμεσος = ${new_games.median():.2f}"
+
+        plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+                fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        plt.tight_layout()
+        plt.savefig('price_comparison_old_vs_new_metacritic.png', dpi=150)
+        print("Το γράφημα 'price_comparison_old_vs_new_metacritic.png' αποθηκεύτηκε.")
+    else:
+        print("Δεν υπάρχουν αρκετά δεδομένα για boxplot τιμών (μόνο με Metacritic)")
+else:
+    print("Δεν υπάρχουν στήλες price/release_year/metacritic_score για το boxplot Metacritic")
+
 # Βήμα 5: Εγγραφή Αποτελεσμάτων σε Αρχείο .txt
 print("\n--- ΕΓΓΡΑΦΗ ΑΠΟΤΕΛΕΣΜΑΤΩΝ ---")
-output_filename = os.path.join(OUTPUT_DIR, 'analysis_results.txt')
+output_filename = 'analysis_results.txt'
 try:
     with open(output_filename, 'w', encoding='utf-8') as f:
         f.write("ΑΠΟΤΕΛΕΣΜΑΤΑ ΑΝΑΛΥΣΗΣ STEAM DATASET (Μάρτιος 2025)\n")
@@ -296,10 +382,24 @@ try:
         else:
             f.write("Δεν υπάρχουν αρκετά δεδομένα για ομαδοποίηση")
         f.write("\n\n")
+        if yearly_stats_mc_filtered is not None:
+            f.write("4b. ΣΥΝΟΨΗ ΤΙΜΩΝ ΑΝΑ ΕΤΟΣ (ΜΟΝΟ ΜΕ METACRITIC)\n")
+            f.write("-"*50 + "\n")
+            f.write(yearly_stats_mc_filtered.to_string())
+            f.write("\n\n")
 
         f.write("5. ΚΥΡΙΑ ΣΥΜΠΕΡΑΣΜΑΤΑ\n")
         f.write("-"*50 + "\n")
         f.write("- Τα περισσότερα παιχνίδια στο Steam έχουν κυκλοφορήσει τα τελευταία χρόνια.\n")
+        if 'metacritic_score' in df.columns:
+            mc_with = df['metacritic_score'].notna() & (df['metacritic_score'] > 0)
+            mc_with_count = int(mc_with.sum())
+            mc_without_count = int((~mc_with).sum())
+            f.write(f"- Παιχνίδια με Metacritic score: {mc_with_count} | χωρίς Metacritic: {mc_without_count}.\n")
+            if mc_without_count > mc_with_count:
+                f.write("- Το μεγαλύτερο πλήθος παιχνιδιών δεν έχει Metacritic score.\n")
+            else:
+                f.write("- Το μεγαλύτερο πλήθος παιχνιδιών έχει Metacritic score.\n")
         
         if 'release_year' in df.columns and not df['release_year'].isna().all():
             min_year = int(df['release_year'].min())
@@ -316,12 +416,31 @@ try:
             median_price = df['price'].median()
             f.write(f"- Η μέση τιμή των παιχνιδιών είναι {avg_price:.2f} USD και η διάμεσος τιμή είναι {median_price:.2f} USD.\n")
         
-        if all(col in df.columns for col in ['user_score', 'metacritic_score']):
-            # Υπολογισμός συσχέτισης αν υπάρχουν αρκετά δεδομένα
-            scores_df = df[['user_score', 'metacritic_score']].dropna()
+        if all(col in df.columns for col in ['metacritic_score']):
+            # Υπολογισμός συσχέτισης με την ίδια λογική του γραφήματος
+            user_series = None
+            user_label = 'positive %'
+            if 'pct_pos_total' in df.columns:
+                user_series = pd.to_numeric(df['pct_pos_total'], errors='coerce')
+            elif 'positive_ratio_calc' in df.columns:
+                user_series = pd.to_numeric(df['positive_ratio_calc'], errors='coerce')
+            else:
+                user_series = pd.Series(index=df.index, dtype='float64')
+
+            user_series = user_series.clip(lower=0, upper=100)
+            valid_mask = (
+                df['metacritic_score'].notna() & (df['metacritic_score'] > 0) &
+                user_series.notna() & (user_series > 0)
+            )
+
+            scores_df = pd.DataFrame({
+                'user_series': user_series,
+                'metacritic_score': df['metacritic_score']
+            })[valid_mask].dropna()
+
             if len(scores_df) > 10:
-                correlation = scores_df['user_score'].corr(scores_df['metacritic_score'])
-                f.write(f"- Η συσχέτιση μεταξύ user score (παίκτες) και metacritic score (κριτικοί) είναι {correlation:.3f}.\n")
+                correlation = scores_df['user_series'].corr(scores_df['metacritic_score'])
+                f.write(f"- Η συσχέτιση μεταξύ {user_label} (παίκτες) και metacritic score (κριτικοί) είναι {correlation:.3f}.\n")
                 if correlation > 0.7:
                     f.write("  (Υψηλή θετική συσχέτιση: Παίκτες και κριτικοί τείνουν να συμφωνούν)\n")
                 elif correlation > 0.3:
@@ -330,12 +449,16 @@ try:
                     f.write("  (Χαμηλή συσχέτιση: Παίκτες και κριτικών έχουν διαφορετικές απόψεις)\n")
         
         f.write("\nΓΡΑΦΗΜΑΤΑ ΠΟΥ ΔΗΜΙΟΥΡΓΗΘΗΚΑΝ:\n")
-        if os.path.exists(os.path.join(OUTPUT_DIR, 'avg_price_per_year.png')):
+        if os.path.exists('avg_price_per_year.png'):
             f.write("  - avg_price_per_year.png: Μέση τιμή ανά έτος κυκλοφορίας\n")
-        if os.path.exists(os.path.join(OUTPUT_DIR, 'user_vs_metacritic_score.png')):
+        if os.path.exists('avg_price_per_year_metacritic.png'):
+            f.write("  - avg_price_per_year_metacritic.png: Μέση τιμή ανά έτος (μόνο με Metacritic)\n")
+        if os.path.exists('user_vs_metacritic_score.png'):
             f.write("  - user_vs_metacritic_score.png: Σύγκριση user score vs metacritic score\n")
-        if os.path.exists(os.path.join(OUTPUT_DIR, 'price_comparison_old_vs_new.png')):
+        if os.path.exists('price_comparison_old_vs_new.png'):
             f.write("  - price_comparison_old_vs_new.png: Σύγκριση τιμών παλιών vs καινούριων παιχνιδιών\n")
+        if os.path.exists('price_comparison_old_vs_new_metacritic.png'):
+            f.write("  - price_comparison_old_vs_new_metacritic.png: Σύγκριση τιμών παλιών vs καινούριων (μόνο με Metacritic)\n")
         
         f.write(f"\nΗ ανάλυση ολοκληρώθηκε: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 

@@ -12,14 +12,14 @@ RUN mkdir -p /app
 
 RUN apt-get update && apt-get install -y curl python3 python3-pip procps && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
-
 RUN curl -L https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz \
     -o spark.tgz && \
     tar xzf spark.tgz -C /app && \
     mv /app/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION} ${SPARK_HOME} && \
     rm spark.tgz
+
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 COPY spark-defaults.conf $SPARK_HOME/conf/spark-defaults.conf
 
