@@ -84,6 +84,8 @@ if 'user_score' in df.columns:
     df['user_score'] = pd.to_numeric(df['user_score'], errors='coerce')
 if 'metacritic_score' in df.columns:
     df['metacritic_score'] = pd.to_numeric(df['metacritic_score'], errors='coerce')
+if 'pct_pos_total' in df.columns:
+    df['pct_pos_total'] = pd.to_numeric(df['pct_pos_total'], errors='coerce').clip(lower=0, upper=100)
 
 def normalize_score(series, label):
     """Normalize scores to a 0-100 scale based on detected range."""
@@ -137,12 +139,12 @@ else:
 # 3. Βασική στατιστική για βαθμολογίες
 print("\n3. Περιγραφική στατιστική για user_score:")
 if 'user_score' in df.columns:
-    user_score_stats = df['user_score'].describe()
+    user_score_stats = df.loc[df['user_score'] > 0, 'user_score'].describe()
     print(user_score_stats)
 
 print("\n4. Περιγραφική στατιστική για metacritic_score:")
 if 'metacritic_score' in df.columns:
-    metacritic_stats = df['metacritic_score'].describe()
+    metacritic_stats = df.loc[df['metacritic_score'] > 0, 'metacritic_score'].describe()
     print(metacritic_stats)
 
 # 4. Σύνδεση τιμών και βαθμολογιών ανά έτος
@@ -150,14 +152,16 @@ print("\n5. Μέση τιμή και μέση βαθμολογία ανά έτο
 stats_cols = {}
 if 'price' in df.columns:
     stats_cols['avg_price'] = ('price', 'mean')
-if 'user_score' in df.columns:
-    stats_cols['avg_user_score'] = ('user_score', 'mean')
-if 'metacritic_score' in df.columns:
-    stats_cols['avg_metacritic'] = ('metacritic_score', 'mean')
 if 'pct_pos_total' in df.columns:
     stats_cols['avg_pct_pos'] = ('pct_pos_total', 'mean')
 
 if 'release_year' in df.columns and stats_cols:
+    if 'user_score' in df.columns:
+        df['user_score_valid'] = df['user_score'].where(df['user_score'] > 0)
+        stats_cols['avg_user_score'] = ('user_score_valid', 'mean')
+    if 'metacritic_score' in df.columns:
+        df['metacritic_score_valid'] = df['metacritic_score'].where(df['metacritic_score'] > 0)
+        stats_cols['avg_metacritic'] = ('metacritic_score_valid', 'mean')
     yearly_stats = df.groupby('release_year').agg(
         game_count=('name', 'count'),
         **stats_cols
@@ -222,20 +226,10 @@ else:
 # Γράφημα 2: Σύγκριση βαθμολογιών user_score vs metacritic_score (αν υπάρχουν)
 if all(col in df.columns for col in ['user_score', 'metacritic_score']):
     df['metacritic_score_norm'] = normalize_score(df['metacritic_score'], 'metacritic_score')
+    df['user_score_norm'] = normalize_score(df['user_score'], 'user_score')
     # Φιλτράρουμε τις γραμμές που έχουν και τις δύο βαθμολογίες
-    user_series = None
-    user_label = None
-    if 'pct_pos_total' in df.columns:
-        user_series = pd.to_numeric(df['pct_pos_total'], errors='coerce')
-        user_label = 'Positive % (Χρήστες, 0-100)'
-    elif 'positive_ratio_calc' in df.columns:
-        user_series = pd.to_numeric(df['positive_ratio_calc'], errors='coerce')
-        user_label = 'Positive % (Χρήστες, 0-100)'
-    else:
-        user_series = pd.Series(index=df.index, dtype='float64')
-        user_label = 'Positive % (Χρήστες, 0-100)'
-
-    user_series = user_series.clip(lower=0, upper=100)
+    user_series = pd.to_numeric(df['user_score_norm'], errors='coerce')
+    user_label = 'User Score (Παίκτες, 0-100)'
     valid_mask = (
         df['metacritic_score'].notna() & (df['metacritic_score'] > 0) &
         user_series.notna() & (user_series > 0)
@@ -416,31 +410,25 @@ try:
             median_price = df['price'].median()
             f.write(f"- Η μέση τιμή των παιχνιδιών είναι {avg_price:.2f} USD και η διάμεσος τιμή είναι {median_price:.2f} USD.\n")
         
-        if all(col in df.columns for col in ['metacritic_score']):
+        if all(col in df.columns for col in ['user_score', 'metacritic_score']):
             # Υπολογισμός συσχέτισης με την ίδια λογική του γραφήματος
-            user_series = None
-            user_label = 'positive %'
-            if 'pct_pos_total' in df.columns:
-                user_series = pd.to_numeric(df['pct_pos_total'], errors='coerce')
-            elif 'positive_ratio_calc' in df.columns:
-                user_series = pd.to_numeric(df['positive_ratio_calc'], errors='coerce')
-            else:
-                user_series = pd.Series(index=df.index, dtype='float64')
+            user_series = normalize_score(df['user_score'], 'user_score')
+            meta_series = normalize_score(df['metacritic_score'], 'metacritic_score')
 
-            user_series = user_series.clip(lower=0, upper=100)
             valid_mask = (
-                df['metacritic_score'].notna() & (df['metacritic_score'] > 0) &
+                meta_series.notna() & (meta_series > 0) &
                 user_series.notna() & (user_series > 0)
             )
 
             scores_df = pd.DataFrame({
                 'user_series': user_series,
-                'metacritic_score': df['metacritic_score']
+                'metacritic_score': meta_series
             })[valid_mask].dropna()
 
             if len(scores_df) > 10:
                 correlation = scores_df['user_series'].corr(scores_df['metacritic_score'])
-                f.write(f"- Η συσχέτιση μεταξύ {user_label} (παίκτες) και metacritic score (κριτικοί) είναι {correlation:.3f}.\n")
+                f.write("- Η συσχέτιση μεταξύ user score (παίκτες) και metacritic score (κριτικοί) είναι "
+                        f"{correlation:.3f}.\n")
                 if correlation > 0.7:
                     f.write("  (Υψηλή θετική συσχέτιση: Παίκτες και κριτικοί τείνουν να συμφωνούν)\n")
                 elif correlation > 0.3:

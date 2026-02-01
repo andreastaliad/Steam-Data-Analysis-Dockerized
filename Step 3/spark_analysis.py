@@ -95,6 +95,14 @@ def main():
         to_date(col("release_date"), "yyyy-MM-dd").alias("release_date"),
     ).withColumn("release_year", year(col("release_date")))
 
+    if "pct_pos_total" in df.columns:
+        df = df.withColumn(
+            "pct_pos_total",
+            when(col("pct_pos_total") < 0, 0.0)
+            .when(col("pct_pos_total") > 100, 100.0)
+            .otherwise(col("pct_pos_total")),
+        )
+
     print(f"\nΧρησιμοποιούμε {len(df.columns)} στήλες: {df.columns}")
 
     # Υπολογισμός total_reviews & positive_ratio (μόνο με Spark)
@@ -162,12 +170,12 @@ def main():
 
     # 3. Περιγραφική στατιστική για βαθμολογίες
     print("\n3. Περιγραφική στατιστική για user_score:")
-    user_score_stats_df = df.select("user_score").summary()
+    user_score_stats_df = df.where(col("user_score") > 0).select("user_score").summary()
     user_score_stats_str = format_summary(user_score_stats_df, "user_score")
     print(user_score_stats_str)
 
     print("\n4. Περιγραφική στατιστική για metacritic_score:")
-    metacritic_stats_df = df.select("metacritic_score").summary()
+    metacritic_stats_df = df.where(col("metacritic_score") > 0).select("metacritic_score").summary()
     metacritic_stats_str = format_summary(metacritic_stats_df, "metacritic_score")
     print(metacritic_stats_str)
 
@@ -180,8 +188,8 @@ def main():
         .agg(
             count("name").alias("game_count"),
             avg("price").alias("avg_price"),
-            avg("user_score").alias("avg_user_score"),
-            avg("metacritic_score").alias("avg_metacritic"),
+            avg(when(col("user_score") > 0, col("user_score"))).alias("avg_user_score"),
+            avg(when(col("metacritic_score") > 0, col("metacritic_score"))).alias("avg_metacritic"),
             avg("pct_pos_total").alias("avg_pct_pos"),
         )
     )
@@ -284,33 +292,31 @@ def main():
         print("Δεν υπάρχουν δεδομένα για το γράφημα τιμών (μόνο με Metacritic)")
 
     # Γράφημα 2: Σύγκριση user_score vs metacritic_score
-    user_score_col = when(col("pct_pos_total").isNotNull(), col("pct_pos_total")).otherwise(col("positive_ratio"))
-    user_score_clipped = (
-        when(user_score_col < 0, 0.0)
-        .when(user_score_col > 100, 100.0)
-        .otherwise(user_score_col)
-    )
     scores_df = (
-        df.withColumn("user_score_plot", user_score_clipped)
-        .where(
+        df.where(
             col("metacritic_score").isNotNull() & (col("metacritic_score") > 0) &
-            col("user_score_plot").isNotNull() & (col("user_score_plot") > 0)
+            col("user_score").isNotNull() & (col("user_score") > 0)
         )
-        .select("metacritic_score", "user_score_plot")
+        .select("metacritic_score", "user_score")
     )
     scores_count = scores_df.count()
     if scores_count > 10:
+        max_vals = df.agg(
+            {"metacritic_score": "max", "user_score": "max"}
+        ).collect()[0]
+        max_meta = max_vals["max(metacritic_score)"]
+        max_user = max_vals["max(user_score)"]
+        meta_scale = normalize_score_max(max_meta)
+        user_scale = normalize_score_max(max_user)
+        if meta_scale != 1.0 and max_meta is not None:
+            print(f"Κανονικοποίηση metacritic_score: max={max_meta:.2f}, scale={meta_scale}")
+        if user_scale != 1.0 and max_user is not None:
+            print(f"Κανονικοποίηση user_score: max={max_user:.2f}, scale={user_scale}")
+
         scores_sample = scores_df.limit(5000)
         rows = scores_sample.collect()
-        x_raw = [float(r["metacritic_score"]) for r in rows]
-        y = [min(max(float(r["user_score_plot"]), 0.0), 100.0) for r in rows]
-
-        max_meta_row = df.select("metacritic_score").agg({"metacritic_score": "max"}).collect()
-        max_meta = max_meta_row[0][0] if max_meta_row else None
-        scale = normalize_score_max(max_meta)
-        if scale != 1.0 and max_meta is not None:
-            print(f"Κανονικοποίηση metacritic_score: max={max_meta:.2f}, scale={scale}")
-        x = [min(max(val * scale, 0.0), 100.0) for val in x_raw]
+        x = [min(max(float(r["metacritic_score"]) * meta_scale, 0.0), 100.0) for r in rows]
+        y = [min(max(float(r["user_score"]) * user_scale, 0.0), 100.0) for r in rows]
 
         plt.figure(figsize=(10, 6))
         plt.scatter(x, y, alpha=0.5)
@@ -319,7 +325,7 @@ def main():
             fontsize=14,
         )
         plt.xlabel("Metacritic Score (Κριτικοί, 0-100)")
-        plt.ylabel("Positive % (Χρήστες, 0-100)")
+        plt.ylabel("User Score (Παίκτες, 0-100)")
 
         if len(x) > 1:
             z = np.polyfit(x, y, 1)
@@ -327,7 +333,11 @@ def main():
             xs_line = np.linspace(min(x), max(x), 100)
             plt.plot(xs_line, p(xs_line), "r--", alpha=0.8)
 
-        correlation = scores_df.stat.corr("metacritic_score", "user_score_plot")
+        scores_norm_df = scores_df.select(
+            (col("metacritic_score") * meta_scale).alias("metacritic_score_norm"),
+            (col("user_score") * user_scale).alias("user_score_norm"),
+        )
+        correlation = scores_norm_df.stat.corr("metacritic_score_norm", "user_score_norm")
         plt.text(
             0.05,
             0.95,
@@ -559,7 +569,7 @@ def main():
             if scores_count > 10:
                 correlation = scores_df.stat.corr("metacritic_score", "user_score_plot")
                 f.write(
-                    f"- Η συσχέτιση μεταξύ positive % (παίκτες) και metacritic score (κριτικοί) "
+                    f"- Η συσχέτιση μεταξύ user score (παίκτες) και metacritic score (κριτικοί) "
                     f"είναι {correlation:.3f}.\n"
                 )
                 if correlation > 0.7:
