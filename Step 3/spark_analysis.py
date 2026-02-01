@@ -285,8 +285,13 @@ def main():
 
     # Γράφημα 2: Σύγκριση user_score vs metacritic_score
     user_score_col = when(col("pct_pos_total").isNotNull(), col("pct_pos_total")).otherwise(col("positive_ratio"))
+    user_score_clipped = (
+        when(user_score_col < 0, 0.0)
+        .when(user_score_col > 100, 100.0)
+        .otherwise(user_score_col)
+    )
     scores_df = (
-        df.withColumn("user_score_plot", user_score_col)
+        df.withColumn("user_score_plot", user_score_clipped)
         .where(
             col("metacritic_score").isNotNull() & (col("metacritic_score") > 0) &
             col("user_score_plot").isNotNull() & (col("user_score_plot") > 0)
