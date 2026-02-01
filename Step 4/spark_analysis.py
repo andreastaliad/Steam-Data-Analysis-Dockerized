@@ -73,6 +73,7 @@ def send_report_to_llm(report_path):
         "Generate a human-friendly narrative of your findings.\n\n"
         "Do not talk about the dataset it self, only the results that are found.\n\n"
         "Produce a short explanation written in a friendly, simple tone.\n\n"
+        "DO NOT SPEAK LIKE ANSWERING TO A USER, speak like an analyst in a board meeting.\n\n"
         "Here is the analysis report you should base your answer on:\n\n"
     )
 
